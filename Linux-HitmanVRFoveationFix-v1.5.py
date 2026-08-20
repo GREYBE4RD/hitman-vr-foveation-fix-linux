@@ -379,7 +379,7 @@ class ThreadStopSet:
 
     def suspend_all(self) -> list[int]:
         seen = set()
-        attached = []
+        self.tids = []
         try:
             for _round in range(3):
                 added = 0
@@ -388,6 +388,9 @@ class ThreadStopSet:
                         continue
                     try:
                         ptrace(PTRACE_ATTACH, tid)
+                        # Track the tracee immediately: every later step can fail,
+                        # and exception cleanup must still be able to detach it.
+                        self.tids.append(tid)
                         wait_stopped(tid)
                         # If this tracer dies while HITMAN is deliberately
                         # suspended, the kernel must kill the tracee rather
@@ -396,10 +399,13 @@ class ThreadStopSet:
                         ptrace(PTRACE_SETOPTIONS, tid, 0, PTRACE_O_EXITKILL)
                     except OSError as exc:
                         if exc.errno in (errno.ESRCH, errno.ECHILD):
+                            # The just-attached thread disappeared before setup
+                            # completed. Do not carry a dead TID into the live set.
+                            if tid in self.tids:
+                                self.tids.remove(tid)
                             continue
                         raise
                     seen.add(tid)
-                    attached.append(tid)
                     added += 1
                 if added == 0:
                     break
@@ -408,8 +414,7 @@ class ThreadStopSet:
             current = set(self._tasks())
             if not current.issubset(seen):
                 raise FixError("game thread list did not become stable")
-            self.tids = attached
-            return list(attached)
+            return list(self.tids)
         except Exception:
             self.resume_all()
             raise
