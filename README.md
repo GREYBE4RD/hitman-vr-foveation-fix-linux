@@ -6,25 +6,29 @@ HITMAN's PC VR renderer uses fixed foveation: a small high-resolution area in th
 
 HitmanVRFoveationFix changes the renderer to use two full-resolution eye layers across the full field of view while preserving the four logical views HITMAN still expects for geometry and visibility.
 
-## What's new in v1.5
+## What's new in v1.6
 
-Windows v1.5 adds two important fixes on top of v1.4:
+Windows v1.6 removes the last timing race in the foveation fix instead of trying to repair it faster.
 
-- **Full field of view in both eyes.** A second view-count setup site is now patched, removing the black oval at the edge of one eye and the associated Instinct-outline smearing.
-- **Faster save-load recovery.** The renderer guard now repairs the scale and mask values directly from its worker thread on a high-resolution ~1 ms timer instead of waiting for the WinForms/PowerShell callback path.
+- **Save/reload black circles fixed at the source.** HITMAN's own mask calculation is patched so the two foveation-mask values are generated as zero every time the renderer rebuilds, including save-game loads.
+- **The polling renderer guard is gone.** v1.6 no longer writes Scale/Mask values into the VR device and no longer needs the ~1 ms worker thread, high-resolution timer, renderer-value ownership state or reload-recovery latch used by v1.5.
+- **Lower background CPU use.** While attached, the normal validation/lifecycle loop remains; while idle, process scanning is throttled to 500 ms. In testing the script generally sat at 0% CPU with only brief peaks around 0.4%.
+- **Status no longer depends on optional refraction paths.** The outer refraction pass is the readiness proof. CopyA/CopyB are still validated and tracked, but an unused path is reported as "not observed" diagnostic coverage rather than keeping the status amber forever.
 
-The v1.4 transparency/refraction fix is preserved: glass, water, bottles and affected lights use the two physical eye views for refraction-depth copies while geometry and visibility keep the required four logical views.
+The v1.5 second view-count fix and the v1.4 transparency/refraction fix are preserved unchanged.
 
 ## Compatibility
 
 | Platform | Status |
 |---|---|
-| Windows / Oculus (LibOVR) | v1.5, supported |
-| Windows / SteamVR (OpenVR) | v1.5, supported |
+| Windows / Oculus (LibOVR) | v1.6, supported |
+| Windows / SteamVR (OpenVR) | v1.6, supported |
 | Linux / Proton / SteamVR | Experimental v1.5 port |
 | Standalone Quest | Not supported |
 
 The Windows implementation is verified against HITMAN World of Assassination build **3.270.1**. Other builds use conservative byte-pattern matching and fail closed if the required code cannot be located uniquely.
+
+v1.6 was tested locally with Oculus Link, Air Link and SteamVR, including repeated mission/save reloads. The original v1.5 save/reload black-circle reproducer was also retested externally on the verified SteamVR/OpenVR build with repeated reloads and did not reproduce on v1.6.
 
 The improvement is most visible on pancake-lens headsets such as Quest 3 and Quest Pro, but the fix also works with Fresnel headsets.
 
@@ -49,7 +53,7 @@ Status colours:
 - **Grey** — waiting for HITMAN
 - **Amber** — VR or the mission is still initializing
 - **Green** — fix active
-- **Red** — the tool stopped because a validation or write check failed
+- **Red** — the tool stopped because a validation or patch-integrity check failed
 
 The tool writes `foveationfix.log` next to the script. If you report a problem, attach that log.
 
@@ -61,16 +65,16 @@ The `.bat` file only launches `HitmanVRFoveationFix.ps1` with the required privi
 
 ## Linux / Proton
 
-The experimental Linux/Python port is currently based on **Windows v1.5** and includes the v1.4 transparency/refraction changes and the v1.5 second view-count fix. The ~1 ms renderer guard remains largely unchanged from the approach first introduced in the Linux v1.3 implementation, with v1.5 adding further validation and fail-safe handling around the same basic mechanism.
+The experimental Linux/Python port is currently based on **Windows v1.5**. It includes the v1.4 transparency/refraction changes and the v1.5 second view-count fix, but it does **not** yet include the Windows v1.6 source-level mask patch or the removal of the polling renderer guard.
 
-The Linux implementation uses the same underlying HITMAN renderer patches and values as the Windows version, with Linux-specific process-memory, thread-control and executable-memory handling for Proton. The Linux files remain available separately in the repository and are not bundled into the Windows release ZIP.
+The Linux implementation uses the same underlying HITMAN renderer concepts with Linux-specific process-memory, thread-control and executable-memory handling for Proton. The Linux files remain available separately in the repository and are not bundled into the Windows release ZIP.
 
 Development and testing of the Linux port were carried out by **GREYBE4RD**, with assistance from ChatGPT, on Arch Linux / SwayWM / Wayland, SteamVR and an AMD Radeon RX 9070 XT. While the port should be largely distro and hardware-agnostic, behaviour on other distributions, desktop environments, hardware configurations and VR setups may vary.
 
 **To run it:**
 
-1. Download the .sh and .py files to the same directory.
-2. Start your terminal of choice and make the .sh file executable and run it:
+1. Download the `.sh` and `.py` files to the same directory.
+2. Make the launcher executable and run it:
 
 ```bash
 chmod +x launch.linux.HitmanVRFoveationFix-v1.5.sh
@@ -80,7 +84,7 @@ chmod +x launch.linux.HitmanVRFoveationFix-v1.5.sh
 3. Enter the `sudo` password when prompted.
 4. Start HITMAN, and leave the terminal open while playing. Press `Ctrl+C` to stop the tool and restore live changes when safe.
 
-## What the fix changes
+## What the Windows fix changes
 
 HITMAN normally renders four foveated layers per frame:
 
@@ -91,9 +95,18 @@ HitmanVRFoveationFix instead uses **two full-resolution eye layers covering the 
 
 HITMAN still expects four logical views in parts of the renderer. The Windows fix therefore keeps the required four-view geometry/visibility behaviour and restricts the refraction-depth copies to the two physical eye views.
 
+v1.6 applies eight small base-code patches:
+
+- two WNO writers are forced off;
+- the Oculus and OpenVR field-of-view limits are forced to the full-view path;
+- both logical view-count setup sites are forced to four;
+- the two instructions that derive the foveation mask are changed so HITMAN itself stores zero for both mask values.
+
+The v1.4 refraction wrappers remain separate from those eight base patches.
+
 ### Performance cost
 
-The change roughly doubles the pixel work compared with the original foveated layout. Whether that affects frame rate depends on available GPU headroom.
+The rendering change roughly doubles the pixel work compared with the original foveated layout. Whether that affects frame rate depends on available GPU headroom.
 
 For the verified setup:
 
@@ -111,14 +124,17 @@ The tool does **not** modify HITMAN files or settings. All changes are made in t
 The Windows implementation is deliberately fail-closed:
 
 - expected code must match before it is patched;
-- renderer fields must pass plausibility checks before they are written;
-- writes are read back and verified;
-- the fast guard shares the same writer lock as the normal lifecycle path;
-- device identity is revalidated before direct guard writes;
-- an unknown or partially verified write state faults the guard and stops further renderer writes;
-- live restore only touches bytes owned by the current tool instance when restoration can be proven safe.
+- the verified build uses fixed, hand-checked instruction contexts;
+- unknown builds must match every required byte pattern uniquely and consistently;
+- all code writes are read back and verified;
+- the VR device geometry block is checked for plausibility before the tool accepts renderer state as initialized;
+- the two mask fields are read-only diagnostics in v1.6: any readable non-zero mask after initialization is treated as a failure rather than silently repaired;
+- refraction wrappers keep active/call/restore telemetry and reject unexpected owner/count states;
+- live removal suspends game threads and refuses to restore code if a thread is executing inside an owned patch/wrapper region or the wrapper state cannot be proven quiescent.
 
-This still is not a zero-risk tool: it writes to the memory of a game with online connectivity. Use it at your own discretion.
+v1.6 does **not** write the VR device Scale or Mask fields. The old renderer-value guard, its lock and its restore/ownership machinery have been removed.
+
+This still is not a zero-risk tool: it writes code into the memory of a game with online connectivity. Use it at your own discretion.
 
 ## Technical documentation
 
@@ -127,9 +143,9 @@ The repository contains additional material for maintenance and reverse engineer
 - [`docs/HOW-IT-WORKS.md`](https://github.com/RealChrizzl/hitman-vr-foveation-fix/blob/main/docs/HOW-IT-WORKS.md) — renderer architecture and patch rationale
 - [`docs/UPDATING.md`](https://github.com/RealChrizzl/hitman-vr-foveation-fix/blob/main/docs/UPDATING.md) — signatures and update procedure
 - [`tools/HitmanVRProbe.ps1`](https://github.com/RealChrizzl/hitman-vr-foveation-fix/blob/main/tools/HitmanVRProbe.ps1) — read-only diagnostic probe
-- [`CHANGELOG-v1.5.md`](CHANGELOG-v1.5.md) — v1.5 changes
+- [`CHANGELOG-v1.6.md`](CHANGELOG-v1.6.md) — v1.6 changes
 
-Detailed docs, screenshots, diagnostic tools and Linux-port files are intentionally **not** bundled into the Windows v1.5 release ZIP.
+Detailed docs, screenshots, diagnostic tools and Linux-port files are intentionally **not** bundled into the Windows v1.6 release ZIP.
 
 ## Reporting problems
 
