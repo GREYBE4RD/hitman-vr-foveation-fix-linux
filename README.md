@@ -23,7 +23,7 @@ The v1.5 second view-count fix and the v1.4 transparency/refraction fix are pres
 |---|---|
 | Windows / Oculus (LibOVR) | v1.6, supported |
 | Windows / SteamVR (OpenVR) | v1.6, supported |
-| Linux / Proton / SteamVR | Experimental v1.5 port |
+| Linux / Proton / SteamVR | Experimental v1.6 port |
 | Standalone Quest | Not supported |
 
 The Windows implementation is verified against HITMAN World of Assassination build **3.270.1**. Other builds use conservative byte-pattern matching and fail closed if the required code cannot be located uniquely.
