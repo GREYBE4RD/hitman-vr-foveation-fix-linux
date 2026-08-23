@@ -23,7 +23,7 @@ The v1.5 second view-count fix and the v1.4 transparency/refraction fix are pres
 |---|---|
 | Windows / Oculus (LibOVR) | v1.6, supported |
 | Windows / SteamVR (OpenVR) | v1.6, supported |
-| Linux / Proton / SteamVR | Experimental v1.5 port |
+| Linux / Proton / SteamVR | Experimental v1.6 port |
 | Standalone Quest | Not supported |
 
 The Windows implementation is verified against HITMAN World of Assassination build **3.270.1**. Other builds use conservative byte-pattern matching and fail closed if the required code cannot be located uniquely.
@@ -65,9 +65,13 @@ The `.bat` file only launches `HitmanVRFoveationFix.ps1` with the required privi
 
 ## Linux / Proton
 
-The experimental Linux/Python port is currently based on **Windows v1.5**. It includes the v1.4 transparency/refraction changes and the v1.5 second view-count fix, but it does **not** yet include the Windows v1.6 source-level mask patch or the removal of the polling renderer guard.
+The experimental Linux/Python port is currently based on **Windows v1.6**. It includes the v1.4 transparency/refraction changes, the v1.5 second view-count fix, and the v1.6 source-level mask patches that eliminate the save/reload black-circle race at its source.
+
+The previous ~1 ms polling renderer guard and all scale/mask device writes have been removed. HITMAN now generates the required zero mask values itself whenever the renderer recalculates them. Scale values are left untouched and are read only as an initialization/plausibility check, while mask values are read only as a correctness check.
 
 The Linux implementation uses the same underlying HITMAN renderer concepts with Linux-specific process-memory, thread-control and executable-memory handling for Proton. The Linux files remain available separately in the repository and are not bundled into the Windows release ZIP.
+
+Linux-specific fail-closed hardening includes `PTRACE_O_EXITKILL` on suspended game threads, strict `SIGTRAP` and RIP validation for injected remote syscalls, wrapper ownership/balance checks, and stuck-active detection.
 
 Development and testing of the Linux port were carried out by **GREYBE4RD**, with assistance from ChatGPT, on Arch Linux / SwayWM / Wayland, SteamVR and an AMD Radeon RX 9070 XT. While the port should be largely distro and hardware-agnostic, behaviour on other distributions, desktop environments, hardware configurations and VR setups may vary.
 
@@ -77,8 +81,8 @@ Development and testing of the Linux port were carried out by **GREYBE4RD**, wit
 2. Make the launcher executable and run it:
 
 ```bash
-chmod +x launch.linux.HitmanVRFoveationFix-v1.5.sh
-./launch.linux.HitmanVRFoveationFix-v1.5.sh
+chmod +x launch.linux.HitmanVRFoveationFix-v1.6.sh
+./launch.linux.HitmanVRFoveationFix-v1.6.sh
 ```
 
 3. Enter the `sudo` password when prompted.

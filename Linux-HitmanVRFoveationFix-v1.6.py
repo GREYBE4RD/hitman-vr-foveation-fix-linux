@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # Linux port developed with assistance from ChatGPT.
 """
-HitmanVRFoveationFix v1.5.1 - Linux/Proton port
+HitmanVRFoveationFix v1.6.0 - Linux/Proton port
 
-Based on RealChrizzl's Windows/PowerShell v1.5 implementation.
+Based on RealChrizzl's Windows/PowerShell v1.6 implementation.
 
-v1.5 carries forward the v1.4 refraction-depth fix and adds:
-  - A second view-count patch so both 1/2/4 view-count setup sites retain the
-    required four logical geometry views.
-  - A ~1 ms direct renderer guard. After the validated main transaction has
-    established ownership, the guard can restore only the 24 owned scale/mask
-    bytes on its own thread, with device/vtable/plausibility checks and
-    fail-closed readback handling.
+v1.6 removes the save/reload mask race at its source:
+  - Two renderer-code patches make HITMAN generate zero foveation-mask values
+    itself whenever the renderer recalculates them.
+  - Scale and mask device fields are no longer written by the tool.
+  - The ~1 ms renderer guard and its ownership/rollback/reload machinery are
+    removed.
+  - Scale remains a read-only initialization/plausibility gate; mask becomes a
+    read-only correctness check and must be zero once initialized.
+  - Refraction readiness is proven by the outer owner path; CopyA/CopyB remain
+    independently validated runtime-coverage diagnostics.
 
 Linux-specific implementation:
   - /proc/<pid>/mem for process memory
@@ -39,14 +42,13 @@ import signal
 import stat
 import struct
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-FIX_VERSION = "1.5.1"
-UPSTREAM_VERSION = "1.5"
+FIX_VERSION = "1.6.0"
+UPSTREAM_VERSION = "1.6"
 
 # ===========================================================================
 # VERIFIED PATH - HITMAN build 3.270.1
@@ -72,10 +74,7 @@ OFF_FOV = 0x420
 OFF_SCALE = 0x490
 OFF_MASK = 0x4C0
 
-SCALE_FIX = struct.pack("<4I", 0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000)
-SCALE_STOCK = struct.pack("<4I", 0x3EDF2BF0, 0x3ECE8B44, 0x4012D426, 0x401EA625)
 MASK_FIX = bytes.fromhex("00 00 00 00 00 00 00 00")
-MASK_STOCK = bytes.fromhex("3D 2D 66 3F DA B9 4D 3E")
 
 
 @dataclass
@@ -128,6 +127,13 @@ VERIFIED_VIEW_COUNT_2 = Site(
     bytes.fromhex("80 B9 1B 03 00 00 00"),
     bytes.fromhex("48 85 E4 90 90 90 90"),
 )
+
+VERIFIED_MASK_SOURCE = [
+    Site("mask b zero at source", 0x011CDAC1,
+         bytes.fromhex("F3 0F 59 C0"), bytes.fromhex("0F 57 C0 90")),
+    Site("mask a zero at source", 0x011CDAC9,
+         bytes.fromhex("F3 0F 59 D2"), bytes.fromhex("0F 57 D2 90")),
+]
 
 REFRACTION_DEPTH_ZERO = Site(
     "CopyRefractionDepth base slice zero", 0x0128FF20,
@@ -188,7 +194,7 @@ COPY_DEPTH_CALL_B = HookDesc(
 HOOK_KINDS = ("Outer", "CopyA", "CopyB")
 HOOK_DESCS_VERIFIED = [COPY_DEPTH_CALL_A, COPY_DEPTH_CALL_B, TRANSPARENT_PASS_CALL]
 
-VERIFIED_CODE = VERIFIED_WNO_WRITERS + VERIFIED_PRIMARY_DEPTH_CB + [VERIFIED_VIEW_COUNT, VERIFIED_VIEW_COUNT_2]
+VERIFIED_CODE = VERIFIED_WNO_WRITERS + VERIFIED_PRIMARY_DEPTH_CB + [VERIFIED_VIEW_COUNT, VERIFIED_VIEW_COUNT_2] + VERIFIED_MASK_SOURCE
 
 CORE_VIEW_EXTENSION = [CAMERA_RECORDS_4] + CORE_DRAW_GATES_4 + OCCLUDER_STATE_4
 LEGACY_TESTKIT3_SITES = [REFRACTION_DEPTH_ZERO, CAMERA_STATE_4, ASSAO_DEPTH_4, SSR_FRUSTA_4] + CORE_VIEW_EXTENSION
@@ -245,6 +251,12 @@ SIGS = [
     (9, bytes.fromhex("48 85 E4 90 90 90 90"),
      "49 8B 8D A0 41 01 00 74 1A 80 B9 1B 03 00 00 00 BF 02 00 00",
      "view count 4, second site - without this, one eye keeps an oval mask"),
+    (14, bytes.fromhex("0F 57 C0 90"),
+     "F3 0F 10 41 30 F3 0F 5E 41 18 F3 0F 5E D1 F3 0F 59 C0 41 0F 28 C8 F3 0F 59 D2 F3 0F 11 81 B4 00 00 00 F3 0F 10 41 44 F3 0F 58 C0 F3 0F 11 91 B0 00 00 00 0F 11 99 80 00 00 00 41 0F 28 D8 41 0F 28 D0",
+     "mask b zero at source - the black centre circle"),
+    (22, bytes.fromhex("0F 57 D2 90"),
+     "F3 0F 10 41 30 F3 0F 5E 41 18 F3 0F 5E D1 F3 0F 59 C0 41 0F 28 C8 F3 0F 59 D2 F3 0F 11 81 B4 00 00 00 F3 0F 10 41 44 F3 0F 58 C0 F3 0F 11 91 B0 00 00 00 0F 11 99 80 00 00 00 41 0F 28 D8 41 0F 28 D0",
+     "mask a zero at source - the overlay pass"),
 ]
 
 HOOK_SIGS = [
@@ -269,17 +281,8 @@ class FixError(RuntimeError):
 
 
 @dataclass
-class SyncResult:
-    initialized: bool = False
-    fixed: bool = False
-    wrote: bool = False
-    error: str = ""
-
-
-@dataclass
 class LifecycleResult:
     last_transition: int
-    need_reload: bool
     transition_changed: bool
     reset_stable: bool
 
@@ -810,43 +813,12 @@ class HitmanFix:
 
         self.dev = 0
         self.last_trans = -1
-        self.need_reload = False
-        self.pending_value_write = False
         self.stable_ready = 0
         self.stable_since = 0.0
 
-        self.scale_stock: Optional[bytes] = None
-        self.mask_stock: Optional[bytes] = None
-        self.scale_touched = False
-        self.mask_touched = False
-        self.device_restore_uncertain = False
-
         self.runtime_loaded = False
         self.last_runtime_check = 0.0
-        self.last_write_log = 0.0
-        self.last_guard_write_log = 0.0
-
-        self.render_lock = threading.Lock()
-        self.state_lock = threading.Lock()
-        self.guard_thread: Optional[threading.Thread] = None
-        self.guard_stop = threading.Event()
-        self.guard_device = 0
-        self.guard_device_pointer = 0
-        self.guard_expected_vtable = 0
-        self.guard_armed = False
-        self.guard_fault = False
-        self.guard_write_pending = False
-        self.guard_direct_repair = False
-        self.guard_reload_latch = False
-        self.guard_reload_saw_non3 = False
-        self.guard_error = ""
-        self.guard_reads = 0
-        self.guard_mismatches = 0
-        self.guard_repairs = 0
-        self.guard_repair_failures = 0
-        self.guard_read_failures = 0
-        self.guard_slow_intervals = 0
-        self.guard_max_interval_us = 0
+        self.last_attach_scan = 0.0
 
         self.last_status = ""
         self.fatal = ""
@@ -1150,107 +1122,7 @@ class HitmanFix:
             return False
         return "openvr_api" in text or "libovrrt" in text
 
-    # ----- renderer sync/guard ---------------------------------------------
-
-    def sync_render_values_locked(self, d: int) -> SyncResult:
-        r = SyncResult()
-        fb = self.rb(d + OFF_FOV, 16)
-        for i in range(4):
-            f = struct.unpack_from("<f", fb, i * 4)[0]
-            if math.isnan(f) or math.isinf(f) or not 0.2 <= f <= 3.0:
-                return r
-
-        sb = self.rb(d + OFF_SCALE, 16)
-        for i in range(4):
-            f = struct.unpack_from("<f", sb, i * 4)[0]
-            if math.isnan(f) or math.isinf(f) or not 0.05 <= f <= 20.0:
-                return r
-
-        mb = self.rb(d + OFF_MASK, 8)
-        for i in range(2):
-            f = struct.unpack_from("<f", mb, i * 4)[0]
-            if math.isnan(f) or math.isinf(f) or not -0.01 <= f <= 4.0:
-                return r
-
-        r.initialized = True
-        if sb != SCALE_FIX:
-            was = self.scale_touched
-            if not was:
-                self.scale_stock = sb
-            self.scale_touched = True
-            r.wrote = True
-            try:
-                self.wb(d + OFF_SCALE, SCALE_FIX)
-            except Exception:
-                pass
-            try:
-                after = self.rb(d + OFF_SCALE, 16)
-            except Exception:
-                self.device_restore_uncertain = True
-                r.error = "Scale write could not be verified."
-                return r
-            if after != SCALE_FIX:
-                rolled = after == sb
-                if not rolled:
-                    try:
-                        self.wb(d + OFF_SCALE, sb)
-                        rolled = self.rb(d + OFF_SCALE, 16) == sb
-                    except Exception:
-                        rolled = False
-                if rolled and not was:
-                    self.scale_touched = False
-                    self.scale_stock = None
-                if not rolled:
-                    self.device_restore_uncertain = True
-                r.error = "Scale write failed and was rolled back." if rolled else "Scale write left an unknown value."
-                return r
-
-        if mb != MASK_FIX:
-            was = self.mask_touched
-            if not was:
-                self.mask_stock = mb
-            self.mask_touched = True
-            r.wrote = True
-            try:
-                self.wb(d + OFF_MASK, MASK_FIX)
-            except Exception:
-                pass
-            try:
-                after = self.rb(d + OFF_MASK, 8)
-            except Exception:
-                self.device_restore_uncertain = True
-                r.error = "Mask write could not be verified."
-                return r
-            if after != MASK_FIX:
-                rolled = after == mb
-                if not rolled:
-                    try:
-                        self.wb(d + OFF_MASK, mb)
-                        rolled = self.rb(d + OFF_MASK, 8) == mb
-                    except Exception:
-                        rolled = False
-                if rolled and not was:
-                    self.mask_touched = False
-                    self.mask_stock = None
-                if not rolled:
-                    self.device_restore_uncertain = True
-                r.error = "Mask write failed and was rolled back." if rolled else "Mask write left an unknown value."
-                return r
-
-        try:
-            r.fixed = self.rb(d + OFF_SCALE, 16) == SCALE_FIX and self.rb(d + OFF_MASK, 8) == MASK_FIX
-        except Exception:
-            r.error = "Render values were written but final verification failed."
-        return r
-
-    def sync_render_values(self, d: int) -> SyncResult:
-        with self.render_lock:
-            with self.state_lock:
-                if self.guard_fault:
-                    return SyncResult(
-                        error="A renderer value was left in an unknown state after a partial write. Close HITMAN."
-                    )
-            return self.sync_render_values_locked(d)
+    # ----- renderer validation ---------------------------------------------
 
     @staticmethod
     def floats_in_range(data: bytes, count: int, lo: float, hi: float) -> bool:
@@ -1260,252 +1132,21 @@ class HitmanFix:
                 return False
         return True
 
-    def guard_device_still_current(self, d: int, device_pointer: int, expected_vtable: int) -> bool:
-        try:
-            return self.i64(device_pointer) == d and self.i64(d) == expected_vtable
-        except Exception:
-            return False
+    def check_render_values(self, d: int) -> tuple[bool, bool]:
+        # v1.6 never writes FOV, scale or mask device fields. FOV and scale are
+        # initialization/plausibility gates only.
+        fov = self.rb(d + OFF_FOV, 16)
+        if not self.floats_in_range(fov, 4, 0.2, 3.0):
+            return False, False
 
-    def guard_repair_field(
-        self, d: int, device_pointer: int, expected_vtable: int,
-        address: int, expected: bytes, float_count: int, lo: float, hi: float
-    ) -> int:
-        # 0=already OK, 1=written+verified, 2=skipped, 3=unchanged,
-        # 4=unknown after write attempt.
-        try:
-            before = self.rb(address, len(expected))
-        except Exception:
-            return 2
-        if before == expected:
-            return 0
-        if not self.floats_in_range(before, float_count, lo, hi):
-            return 2
-        if not self.guard_device_still_current(d, device_pointer, expected_vtable):
-            return 2
+        scale = self.rb(d + OFF_SCALE, 16)
+        if not self.floats_in_range(scale, 4, 0.05, 20.0):
+            return False, False
 
-        # A short/failed pwrite may still have changed a prefix. Only readback
-        # determines the state after a write attempt.
-        try:
-            self.wb(address, expected)
-        except Exception:
-            pass
-        try:
-            after = self.rb(address, len(expected))
-        except Exception:
-            return 4
-        if after == expected:
-            return 1
-        if after == before:
-            return 3
-        return 4
-
-    def guard_try_repair(self, d: int, device_pointer: int, expected_vtable: int) -> None:
-        with self.state_lock:
-            if not self.guard_armed or self.guard_fault:
-                return
-
-        if not self.render_lock.acquire(blocking=False):
-            return
-        try:
-            with self.state_lock:
-                if not self.guard_armed or self.guard_fault:
-                    return
-            if self.guard_stop.is_set():
-                return
-            if not self.guard_device_still_current(d, device_pointer, expected_vtable):
-                return
-
-            # Whole-block preflight: a half-built device must not receive a
-            # one-field repair.
-            try:
-                fov = self.rb(d + OFF_FOV, 16)
-                scale = self.rb(d + OFF_SCALE, 16)
-                mask = self.rb(d + OFF_MASK, 8)
-            except Exception:
-                return
-            if not self.floats_in_range(fov, 4, 0.2, 3.0):
-                return
-            if not self.floats_in_range(scale, 4, 0.05, 20.0):
-                return
-            if not self.floats_in_range(mask, 2, -0.01, 4.0):
-                return
-
-            rs = self.guard_repair_field(
-                d, device_pointer, expected_vtable,
-                d + OFF_SCALE, SCALE_FIX, 4, 0.05, 20.0
-            )
-            wrote = rs == 1
-            rm = 2
-            if rs in (0, 1):
-                rm = self.guard_repair_field(
-                    d, device_pointer, expected_vtable,
-                    d + OFF_MASK, MASK_FIX, 2, -0.01, 4.0
-                )
-                wrote = wrote or rm == 1
-
-            if wrote:
-                try:
-                    transition = self.u32(d + OFF_TRANS)
-                except Exception:
-                    transition = -1
-                with self.state_lock:
-                    self.guard_repairs += 1
-                    self.guard_direct_repair = True
-                    if transition == 3:
-                        self.guard_reload_latch = True
-                        self.guard_reload_saw_non3 = False
-
-            if rs == 4 or rm == 4:
-                with self.state_lock:
-                    self.guard_fault = True
-                    self.guard_armed = False
-                    self.guard_repair_failures += 1
-                    self.guard_error = (
-                        "A renderer value was left in an unknown state after a partial write. Close HITMAN."
-                    )
-                return
-
-            if rs == 3 or rm == 3:
-                with self.state_lock:
-                    self.guard_repair_failures += 1
-
-        except Exception:
-            with self.state_lock:
-                self.guard_repair_failures += 1
-        finally:
-            self.render_lock.release()
-
-    def guard_loop(self, d: int) -> None:
-        with self.state_lock:
-            device_pointer = self.guard_device_pointer
-            expected_vtable = self.guard_expected_vtable
-
-        last = time.perf_counter_ns()
-        while not self.guard_stop.wait(0.001) and self.alive():
-            now_ns = time.perf_counter_ns()
-            interval_us = (now_ns - last) // 1000
-            last = now_ns
-            with self.state_lock:
-                if interval_us > 4000:
-                    self.guard_slow_intervals += 1
-                if interval_us > self.guard_max_interval_us:
-                    self.guard_max_interval_us = int(interval_us)
-                if self.guard_device != d or self.dev != d:
-                    return
-                armed = self.guard_armed
-                faulted = self.guard_fault
-            if faulted:
-                return
-
-            try:
-                scale = self.rb(d + OFF_SCALE, 16)
-                mask = self.rb(d + OFF_MASK, 8)
-            except Exception:
-                if not self.alive():
-                    return
-                with self.state_lock:
-                    self.guard_read_failures += 1
-                continue
-
-            with self.state_lock:
-                self.guard_reads += 1
-            if scale == SCALE_FIX and mask == MASK_FIX:
-                continue
-
-            with self.state_lock:
-                self.guard_mismatches += 1
-            if armed:
-                self.guard_try_repair(d, device_pointer, expected_vtable)
-
-    def start_guard(self, d: int) -> bool:
-        with self.state_lock:
-            if self.guard_thread and self.guard_thread.is_alive() and self.guard_device == d:
-                return True
-        if not self.stop_guard():
-            return False
-
-        if self.mode == "verified":
-            device_pointer = self.base + MANAGER_RVA + MANAGER_DEVICE_OFFSET
-        else:
-            device_pointer = self.base + self.dev_slot
-        try:
-            expected_vtable = self.i64(d)
-        except Exception:
-            expected_vtable = 0
-        if not expected_vtable:
-            with self.state_lock:
-                self.guard_error = "The VR device vtable could not be read, so the renderer guard was not started."
-            return False
-
-        with self.state_lock:
-            self.guard_stop = threading.Event()
-            self.guard_device = d
-            self.guard_device_pointer = device_pointer
-            self.guard_expected_vtable = expected_vtable
-            self.guard_armed = False
-            self.guard_fault = False
-            self.guard_error = ""
-            self.guard_reads = 0
-            self.guard_mismatches = 0
-            self.guard_repairs = 0
-            self.guard_repair_failures = 0
-            self.guard_read_failures = 0
-            self.guard_slow_intervals = 0
-            self.guard_max_interval_us = 0
-            thread = threading.Thread(
-                target=self.guard_loop, args=(d,), daemon=True,
-                name="HitmanVR renderer guard"
-            )
-            self.guard_thread = thread
-        thread.start()
-        self.log(f"continuous 1 ms renderer guard started for device 0x{d:X}")
-        return True
-
-    def arm_guard_if_owned(self) -> None:
-        with self.state_lock:
-            if (
-                self.guard_thread
-                and self.guard_thread.is_alive()
-                and not self.guard_fault
-                and self.scale_touched
-                and self.mask_touched
-            ):
-                self.guard_armed = True
-
-    def stop_guard(self) -> bool:
-        with self.state_lock:
-            ev = self.guard_stop
-            th = self.guard_thread
-            self.guard_armed = False
-        ev.set()
-        if th and th.is_alive():
-            th.join(timeout=2.0)
-            if th.is_alive():
-                self.fatal = "The continuous renderer guard did not stop in time. Close HITMAN."
-                return False
-
-        with self.state_lock:
-            reads = self.guard_reads
-            mismatches = self.guard_mismatches
-            repairs = self.guard_repairs
-            failures = self.guard_repair_failures
-            read_failures = self.guard_read_failures
-            slow = self.guard_slow_intervals
-            max_us = self.guard_max_interval_us
-            had_thread = th is not None
-            self.guard_thread = None
-            self.guard_device = 0
-            self.guard_device_pointer = 0
-            self.guard_expected_vtable = 0
-
-        if had_thread:
-            self.log(
-                "renderer guard stopped; "
-                f"reads={reads}, mismatches={mismatches}, repairs={repairs}, "
-                f"repairFailures={failures}, readFailures={read_failures}, "
-                f"slowIntervals={slow}, maxInterval={max_us} us"
-            )
-        return True
+        # HITMAN now computes these itself. Once the device block is initialized,
+        # any readable non-zero mask means the source patch did not take.
+        mask = self.rb(d + OFF_MASK, 8)
+        return True, mask == MASK_FIX
 
     # ----- hook cave --------------------------------------------------------
 
@@ -1592,21 +1233,17 @@ class HitmanFix:
             copy_b_restored=q(0x90), copy_b_active=q(0x98),
         )
 
-    def hook_state(self) -> tuple[bool, str]:
+    def hook_state(self) -> tuple[bool, str, str]:
         if not self.hook_prepared:
-            return False, ""
+            return False, "", "no copy path observed"
         try:
             t = self.read_telemetry()
             if t is None:
-                return False, "hook telemetry unavailable"
+                return False, "hook telemetry unavailable", "no copy path observed"
             if t["bad_count"] or t["bad_state"] or t["max_top"] > 4:
-                return False, "wrapper rejected an unexpected owner/count state"
+                return False, "wrapper rejected an unexpected owner/count state", ""
 
             now = time.monotonic()
-
-            # Match the Windows v1.5 runtime sanity checks. Balance and owner
-            # cleanup are only asserted after two stable inactive samples so
-            # an in-flight wrapper is not mistaken for corruption.
             stable_inactive = False
             if t["active"] == 0 and t["copy_a_active"] == 0 and t["copy_b_active"] == 0:
                 t2 = self.read_telemetry()
@@ -1630,22 +1267,21 @@ class HitmanFix:
 
             if stable_inactive:
                 if t["owner_tid"] != 0 or t["owner_ctx"] != 0:
-                    return False, "transparent-pass owner marker stayed set"
+                    return False, "transparent-pass owner marker stayed set", ""
                 if t["owner_acquired"] != t["owner_released"]:
-                    return False, "transparent-pass owner acquisition was not balanced"
+                    return False, "transparent-pass owner acquisition was not balanced", ""
                 if t["changed"] != t["restored"]:
-                    return False, "outer wrapper count change was not restored"
+                    return False, "outer wrapper count change was not restored", ""
                 if t["copy_a_changed"] != t["copy_a_restored"]:
-                    return False, "CopyA count change was not restored"
+                    return False, "CopyA count change was not restored", ""
                 if t["copy_b_changed"] != t["copy_b_restored"]:
-                    return False, "CopyB count change was not restored"
+                    return False, "CopyB count change was not restored", ""
 
-            active_map = {
-                "Outer": (t["active"], t["calls"] + t["restored"]),
-                "CopyA": (t["copy_a_active"], t["copy_a_calls"] + t["copy_a_restored"]),
-                "CopyB": (t["copy_b_active"], t["copy_b_calls"] + t["copy_b_restored"]),
-            }
-            for name, (active_count, progress_value) in active_map.items():
+            for name, active_count, progress_value in (
+                ("Outer", t["active"], t["calls"] + t["restored"]),
+                ("CopyA", t["copy_a_active"], t["copy_a_calls"] + t["copy_a_restored"]),
+                ("CopyB", t["copy_b_active"], t["copy_b_calls"] + t["copy_b_restored"]),
+            ):
                 if active_count == 0:
                     self.hook_progress.pop(name, None)
                     continue
@@ -1653,25 +1289,38 @@ class HitmanFix:
                 if old is None or old[0] != progress_value:
                     self.hook_progress[name] = (progress_value, now)
                 elif now - old[1] >= 10.0:
-                    return False, f"{name} wrapper stayed active without progress for ten seconds"
+                    return False, f"{name} wrapper stayed active without progress for ten seconds", ""
 
             if now - self.last_integrity_check >= 2.0:
-                for s in self.sites:
-                    if self.rb(self.base + s.rva, len(s.fix)) != s.fix:
-                        return False, f"base fix changed at RVA 0x{s.rva:X}"
-                for g in self.guard_sites:
-                    if self.rb(self.base + g.rva, len(g.stock)) != g.stock:
-                        return False, f"stock guard changed at RVA 0x{g.rva:X}"
-                for s in self.hook_sites:
-                    if self.rb(self.base + s.rva, len(s.fix)) != s.fix:
-                        return False, f"{s.kind} call block changed"
-                    if self.rb(s.wrapper_address, len(s.wrapper)) != s.wrapper:
-                        return False, f"{s.kind} wrapper changed"
+                for site in self.sites:
+                    if self.rb(self.base + site.rva, len(site.fix)) != site.fix:
+                        return False, f"base fix changed at RVA 0x{site.rva:X}", ""
+                for guard in self.guard_sites:
+                    if self.rb(self.base + guard.rva, len(guard.stock)) != guard.stock:
+                        return False, f"stock guard changed at RVA 0x{guard.rva:X}", ""
+                for site in self.hook_sites:
+                    if self.rb(self.base + site.rva, len(site.fix)) != site.fix:
+                        return False, f"{site.kind} call block changed", ""
+                    if self.rb(site.wrapper_address, len(site.wrapper)) != site.wrapper:
+                        return False, f"{site.kind} wrapper changed", ""
                 if self.rb(self.hook_cave + 0x1400, 12) != b"HMFIX-V1.4-W":
-                    return False, "wrapper ownership marker changed"
+                    return False, "wrapper ownership marker changed", ""
                 self.last_integrity_check = now
 
-            ready = t["owner_acquired"] > 0 and t["copy_a_changed"] > 0 and t["copy_b_changed"] > 0
+            copy_a = t["copy_a_changed"] > 0 and t["copy_a_restored"] > 0
+            copy_b = t["copy_b_changed"] > 0 and t["copy_b_restored"] > 0
+            coverage = "no copy path observed"
+            if copy_a and copy_b:
+                coverage = "CopyA + CopyB verified"
+            elif copy_a:
+                coverage = "CopyA verified; CopyB not observed"
+            elif copy_b:
+                coverage = "CopyB verified; CopyA not observed"
+
+            # v1.6 readiness proves the outer refraction owner path. CopyA/B
+            # remain optional coverage diagnostics rather than a green-state gate.
+            ready = t["owner_acquired"] > 0
+
             if now - self.last_hook_log >= 5.0:
                 self.log(
                     "pass telemetry: "
@@ -1679,12 +1328,13 @@ class HitmanFix:
                     f"changed={t['changed']}/{t['restored']}, "
                     f"copyA={t['copy_a_calls']}/{t['copy_a_changed']}/{t['copy_a_restored']}, "
                     f"copyB={t['copy_b_calls']}/{t['copy_b_changed']}/{t['copy_b_restored']}, "
-                    f"active={t['active']}/{t['copy_a_active']}/{t['copy_b_active']}"
+                    f"active={t['active']}/{t['copy_a_active']}/{t['copy_b_active']}; "
+                    f"coverage: {coverage}"
                 )
                 self.last_hook_log = now
-            return ready, ""
+            return ready, "", coverage
         except Exception as exc:
-            return False, str(exc)
+            return False, str(exc), ""
 
     # ----- patch transaction ------------------------------------------------
 
@@ -1777,7 +1427,7 @@ class HitmanFix:
 
             self.written_sites = written
             self.patched = True
-            self.log(f"v1.4 code patched, base sites {len(written)}, refraction calls {len(hook_written)}")
+            self.log(f"v1.6 code patched, base sites {len(written)}, refraction calls {len(hook_written)}")
             return True
 
         except Exception as exc:
@@ -1809,179 +1459,94 @@ class HitmanFix:
     # ----- lifecycle --------------------------------------------------------
 
     @staticmethod
-    def advance_lifecycle(last: int, need: bool, trans: int, wrote: bool) -> LifecycleResult:
+    def advance_lifecycle(last: int, trans: int) -> LifecycleResult:
         changed = last != trans
-        if trans != 3:
-            need = False
-        elif wrote:
-            need = True
-        return LifecycleResult(trans, need, changed, changed or wrote)
-
-    def apply_guard_reload_latch(self, life: LifecycleResult, trans: int) -> LifecycleResult:
-        with self.state_lock:
-            if not self.guard_reload_latch:
-                return life
-            if trans != 3:
-                self.guard_reload_saw_non3 = True
-                life.need_reload = True
-            elif self.guard_reload_saw_non3:
-                self.guard_reload_latch = False
-                self.guard_reload_saw_non3 = False
-                life.need_reload = False
-            else:
-                life.need_reload = True
-        return life
+        return LifecycleResult(trans, changed, changed)
 
     # ----- restore ----------------------------------------------------------
 
-    def restore_values(self) -> bool:
-        ok = not self.device_restore_uncertain
-        if not self.dev:
-            return ok
-        try:
-            current = self.get_dev()
-        except Exception:
-            current = 0
-        if current != self.dev:
-            return not (self.scale_touched or self.mask_touched) and ok
-
-        if self.scale_touched:
-            stock = self.scale_stock or SCALE_STOCK
-            try:
-                cur = self.rb(self.dev + OFF_SCALE, 16)
-                if cur == SCALE_FIX:
-                    self.wb(self.dev + OFF_SCALE, stock)
-                    ok &= self.rb(self.dev + OFF_SCALE, 16) == stock
-                elif cur != stock:
-                    ok = False
-            except Exception:
-                ok = False
-        if self.mask_touched:
-            stock = self.mask_stock or MASK_STOCK
-            try:
-                cur = self.rb(self.dev + OFF_MASK, 8)
-                if cur == MASK_FIX:
-                    self.wb(self.dev + OFF_MASK, stock)
-                    ok &= self.rb(self.dev + OFF_MASK, 8) == stock
-                elif cur != stock:
-                    ok = False
-            except Exception:
-                ok = False
-        return ok
-
     def restore(self) -> bool:
-        if not self.stop_guard():
-            return False
         if self.mem_fd is None or not self.alive():
             return True
         if self.unsafe_code_state:
             return False
 
-        with self.render_lock:
+        safe = False
+        for _ in range(20):
+            self.suspended.suspend_all()
             try:
-                safe = False
-                for _ in range(20):
-                    self.suspended.suspend_all()
-                    try:
-                        ranges = []
-                        for s in self.written_sites + self.hook_sites:
-                            start = self.base + s.rva
-                            ranges.append((start, start + len(s.stock)))
-                        for s in self.hook_sites:
-                            ranges.append((s.wrapper_address, s.wrapper_address + len(s.wrapper)))
-                        t = self.read_telemetry()
-                        inactive = (t is None or (
-                            t["active"] == 0 and t["copy_a_active"] == 0 and t["copy_b_active"] == 0
-                            and t["owner_tid"] == 0 and t["owner_ctx"] == 0
-                        ))
-                        safe = inactive and self.suspended.rips_outside(ranges)
-                    except Exception:
-                        self.suspended.resume_all()
-                        return False
-                    if safe:
-                        break
-                    self.suspended.resume_all()
-                    time.sleep(0.050)
-
-                if not safe:
-                    self.fatal = "The refraction pass stayed busy. Close HITMAN or retry."
-                    return False
-
-                restore_order = list(reversed(self.hook_sites)) + list(self.written_sites)
-                restored = []
-                try:
-                    for s in restore_order:
-                        cur = self.rb(self.base + s.rva, len(s.fix))
-                        if cur == s.stock:
-                            continue
-                        if cur != s.fix:
-                            raise FixError(f"foreign bytes at RVA 0x{s.rva:X}")
-                        restored.append(s)
-                        self.wb(self.base + s.rva, s.stock)
-                        if self.rb(self.base + s.rva, len(s.stock)) != s.stock:
-                            raise FixError("restore verification failed")
-                except Exception as exc:
-                    rollback_ok = True
-                    for s in reversed(restored):
-                        try:
-                            self.wb(self.base + s.rva, s.fix)
-                            rollback_ok &= self.rb(self.base + s.rva, len(s.fix)) == s.fix
-                        except Exception:
-                            rollback_ok = False
-                    if not rollback_ok:
-                        self.unsafe_code_state = True
-                        self.fatal = f"Restore failed ({exc}); rollback not verifiable. HITMAN remains suspended."
-                        return False
-                    self.suspended.resume_all()
-                    self.fatal = f"Restore failed ({exc}) and was rolled back safely."
-                    return False
-
-                values_ok = self.restore_values()
-                resume_ok = self.suspended.resume_all()
-                if not resume_ok:
-                    self.fatal = "Fix restored, but one or more HITMAN threads could not be resumed."
-                    return False
-                self.patched = False
-                self.written_sites = []
-                if values_ok:
-                    self.scale_touched = self.mask_touched = False
-                    self.scale_stock = self.mask_stock = None
-                    self.device_restore_uncertain = False
-                    self.log("restored")
-                    return True
-                self.fatal = "Code restored, but a renderer value could not be restored safely."
+                ranges = []
+                for site in self.written_sites + self.hook_sites:
+                    start = self.base + site.rva
+                    ranges.append((start, start + len(site.stock)))
+                for site in self.hook_sites:
+                    ranges.append((site.wrapper_address, site.wrapper_address + len(site.wrapper)))
+                t = self.read_telemetry()
+                inactive = (t is None or (
+                    t["active"] == 0 and t["copy_a_active"] == 0 and t["copy_b_active"] == 0
+                    and t["owner_tid"] == 0 and t["owner_ctx"] == 0
+                ))
+                safe = inactive and self.suspended.rips_outside(ranges)
+            except Exception:
+                self.suspended.resume_all()
                 return False
-            finally:
-                if self.suspended.tids and not self.unsafe_code_state:
-                    self.suspended.resume_all()
+            if safe:
+                break
+            self.suspended.resume_all()
+            time.sleep(0.050)
+
+        if not safe:
+            self.fatal = "The refraction pass stayed busy. Close HITMAN or retry."
+            return False
+
+        restore_order = list(reversed(self.hook_sites)) + list(self.written_sites)
+        restored: list[Site] = []
+        try:
+            for site in restore_order:
+                cur = self.rb(self.base + site.rva, len(site.fix))
+                if cur == site.stock:
+                    continue
+                if cur != site.fix:
+                    raise FixError(f"foreign bytes at RVA 0x{site.rva:X}")
+                restored.append(site)
+                self.wb(self.base + site.rva, site.stock)
+                if self.rb(self.base + site.rva, len(site.stock)) != site.stock:
+                    raise FixError("restore verification failed")
+        except Exception as exc:
+            rollback_ok = True
+            for site in reversed(restored):
+                try:
+                    self.wb(self.base + site.rva, site.fix)
+                    rollback_ok &= self.rb(self.base + site.rva, len(site.fix)) == site.fix
+                except Exception:
+                    rollback_ok = False
+            if not rollback_ok:
+                self.unsafe_code_state = True
+                self.fatal = f"Restore failed ({exc}); rollback not verifiable. HITMAN remains suspended."
+                return False
+            self.suspended.resume_all()
+            self.fatal = f"Restore failed ({exc}) and was rolled back safely."
+            return False
+
+        if not self.suspended.resume_all():
+            self.fatal = "Fix restored, but one or more HITMAN threads could not be resumed."
+            return False
+        self.patched = False
+        self.written_sites = []
+        self.log("restored")
+        return True
 
     # ----- detach/reset -----------------------------------------------------
 
-    def reset_device(self, uncertain=False) -> None:
-        if not self.stop_guard():
-            raise FixError(self.fatal)
-        if uncertain and (self.scale_touched or self.mask_touched):
-            self.device_restore_uncertain = True
+    def reset_device(self) -> None:
         self.dev = 0
         self.last_trans = -1
-        self.need_reload = False
-        self.pending_value_write = False
         self.stable_ready = 0
-        self.stable_since = 0
-        self.scale_stock = self.mask_stock = None
-        self.scale_touched = self.mask_touched = False
+        self.stable_since = 0.0
         self.runtime_loaded = False
-        with self.state_lock:
-            self.guard_write_pending = False
-            self.guard_direct_repair = False
-            self.guard_armed = False
-            self.guard_fault = False
-            self.guard_reload_latch = False
-            self.guard_reload_saw_non3 = False
-            self.guard_error = ""
+        self.last_runtime_check = 0.0
 
     def detach(self) -> None:
-        self.stop_guard()
         if self.suspended.tids and not self.unsafe_code_state:
             self.suspended.resume_all()
         if self.mem_fd is not None:
@@ -2005,7 +1570,10 @@ class HitmanFix:
         self.patched = False
         self.dev = 0
         self.last_trans = -1
-        self.need_reload = False
+        self.stable_ready = 0
+        self.stable_since = 0.0
+        self.runtime_loaded = False
+        self.last_runtime_check = 0.0
         self.last_status = ""
 
     # ----- tick -------------------------------------------------------------
@@ -2017,7 +1585,7 @@ class HitmanFix:
             self.log("game closed")
             self.detach()
             self.fatal = ""
-            self.status("Waiting for HITMAN", "Game closed. Start it again and v1.5.1 will apply automatically.")
+            self.status("Waiting for HITMAN", "Game closed. Start it again and v1.6.0 will apply automatically.")
             return
 
         if self.unsafe_code_state:
@@ -2027,6 +1595,10 @@ class HitmanFix:
             self.status("Not active", self.fatal)
             return
         if self.mem_fd is None:
+            now = time.monotonic()
+            if self.last_attach_scan and now - self.last_attach_scan < 0.5:
+                return
+            self.last_attach_scan = now
             if not self.attach():
                 if self.fatal:
                     self.status("Not active", self.fatal)
@@ -2035,39 +1607,28 @@ class HitmanFix:
         if not self.patched:
             if not self.apply_code():
                 return
-            self.status("Ready - start VR", "v1.5.1 is patched. Start VR and load a mission.")
+            self.status("Ready - start VR", "v1.6.0 is patched. Start VR and load a mission.")
             return
 
-        hook_ready, hook_error = self.hook_state()
+        hook_ready, hook_error, hook_coverage = self.hook_state()
         if hook_error:
-            self.stop_guard()
             self.fatal = f"Pass-local safety monitor detected an unexpected state: {hook_error}"
-            return
-
-        with self.state_lock:
-            guard_error = self.guard_error
-        if guard_error:
-            self.stop_guard()
-            self.fatal = f"Continuous renderer guard stopped after a validated sync error: {guard_error}"
             return
 
         d = self.get_dev()
         if d == -1:
             if self.dev:
-                self.reset_device(True)
+                self.reset_device()
             self.status("Unsupported backend", "Active VR device is neither supported Oculus nor OpenVR.")
             return
         if d == 0:
             if self.dev:
                 self.log("VR device became unavailable")
-                self.reset_device(True)
-            self.status("Ready - start VR", "v1.5.1 is patched; waiting for VR.")
+                self.reset_device()
+            self.status("Ready - start VR", "v1.6.0 is patched; waiting for VR.")
             return
         if d != self.dev:
-            if self.dev:
-                self.reset_device(True)
-            else:
-                self.reset_device(False)
+            self.reset_device()
             self.dev = d
             backend = "unknown"
             try:
@@ -2097,7 +1658,6 @@ class HitmanFix:
                 self.stable_ready = 0
                 self.stable_since = 0
                 self.last_trans = -1
-                self.need_reload = False
                 self.status("Ready - start VR", "Waiting for Oculus/OpenVR runtime.")
                 return
 
@@ -2105,60 +1665,34 @@ class HitmanFix:
             self.status("Not active", "VR started before the patch took effect. Restart HITMAN with the tool running first.")
             return
 
-        sync = self.sync_render_values(d)
-        if not sync.error and sync.initialized and sync.fixed:
-            self.start_guard(d)
-            self.arm_guard_if_owned()
+        initialized, mask_fixed = self.check_render_values(d)
 
-        if sync.wrote:
-            self.pending_value_write = True
-            active = self.u8(d + OFF_ACTIVE)
-            wno = self.u8(d + self.wno_off)
-            trans = self.u32(d + OFF_TRANS)
-            layers = self.u16(d + OFF_LAYERS)
-            tex = self.i64(d + OFF_TEX)
-            width = self.u32(d + OFF_W)
-            height = self.u32(d + OFF_H)
-
-        with self.state_lock:
-            if self.guard_write_pending:
-                self.pending_value_write = True
-                self.guard_write_pending = False
-            direct_repair = self.guard_direct_repair
-            self.guard_direct_repair = False
-
-        if direct_repair:
-            self.stable_ready = 0
-            self.stable_since = 0
-
-        life = self.advance_lifecycle(self.last_trans, self.need_reload, trans, self.pending_value_write)
-        life = self.apply_guard_reload_latch(life, trans)
+        life = self.advance_lifecycle(self.last_trans, trans)
         if life.transition_changed:
             self.log(f"transition {self.last_trans} -> {trans}")
         self.last_trans = life.last_transition
-        self.need_reload = life.need_reload
-        self.pending_value_write = False
         if life.reset_stable:
             self.stable_ready = 0
             self.stable_since = 0
 
-        if sync.error:
-            self.status("Renderer write failed", sync.error)
-            return
         if active != 1:
-            self.status("Ready - start VR", "v1.5.1 is patched; waiting for VR.")
+            self.status("Ready - start VR", "v1.6.0 is patched; waiting for VR.")
             return
-        if not sync.initialized or not sync.fixed:
+        if not initialized:
             self.status("Waiting for renderer", "VR device is still initialising.")
+            return
+        if not mask_fixed:
+            self.status(
+                "Mask patch did not take",
+                "HITMAN is still computing a non-zero foveation mask. "
+                "The patched instruction is not the one this build uses. Close HITMAN and report this."
+            )
             return
         if trans != 3 or layers != 2 or tex == 0:
             self.status("Waiting for mission", "VR is running in two-layer mode. Load a mission.")
             return
         if not hook_ready:
-            self.status("Waiting for scene renderer", "Refraction wrappers are installed. Load a mission so the glass/water pass runs once.")
-            return
-        if self.need_reload:
-            self.status("Reload this mission once", "Renderer values were repaired after the mission state was already live.")
+            self.status("Waiting for scene renderer", "The refraction wrapper is installed but the transparent pass has not run yet. Load a mission.")
             return
 
         now = time.monotonic()
@@ -2172,7 +1706,8 @@ class HitmanFix:
             self.status(
                 "Active",
                 f"Sharp edge-to-edge at {width} x {height} per eye. "
-                "Glass/water refraction uses the corrected two-eye copy path; 1 ms save-load guard running."
+                f"Glass/water refraction uses the corrected two-eye copy path; {hook_coverage}. "
+                "No continuous renderer-value writes."
             )
 
     def run(self) -> int:
@@ -2223,7 +1758,7 @@ def main() -> int:
             return
         cleaned = True
         try:
-            if fix.alive() and (fix.patched or fix.scale_touched or fix.mask_touched):
+            if fix.alive() and fix.patched:
                 if not fix.restore():
                     print("[Close HITMAN] Live restoration was incomplete.", file=sys.stderr)
         finally:
@@ -2235,7 +1770,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, fix.stop)
 
     print(f"HitmanVRFoveationFix v{FIX_VERSION} - Linux/Proton")
-    print("Based on Windows/PowerShell v1.5. Leave this terminal open while you play.")
+    print("Based on Windows/PowerShell v1.6. Leave this terminal open while you play.")
     print("Press Ctrl+C to turn off and restore.")
     rc = fix.run()
     cleanup()
