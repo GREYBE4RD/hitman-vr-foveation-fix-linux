@@ -22,7 +22,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_parent='ac57e65d8b2b1043edadb9688c5a87026a4f5591'
+          expected_parent='8b76ed170a2a771d77daff91a9ffe93c37c66b87'
           actual_parent="$(git rev-parse HEAD^)"
           if [[ "$actual_parent" != "$expected_parent" ]]; then
             echo "Unexpected release base: $actual_parent (expected $expected_parent)" >&2
@@ -39,15 +39,15 @@ jobs:
             exit 1
           fi
 
-      - name: Install the externally tested v1.6.1 candidate
+      - name: Install and verify the externally tested v1.6.1 candidate
         shell: bash
         run: |
           set -euo pipefail
-          cp HitmanVRFoveationFix.ps1 /tmp/repo-v1.6.ps1
-          cp HitmanVRFoveationFix.bat /tmp/repo-v1.6.bat
           curl -fL --retry 3 \
             -o /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip \
             'https://github.com/user-attachments/files/31352425/HitmanVRFoveationFix.1.6.1.zip'
+
+          echo 'c94a7aae38e6eeb97323c902726da6ec1fb4e7b5eef835f4bff2d8f7ef178d75  /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip' | sha256sum -c -
 
           mapfile -t entries < <(unzip -Z1 /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip | sort)
           if [[ ${#entries[@]} -ne 2 || "${entries[0]}" != 'HitmanVRFoveationFix.bat' || "${entries[1]}" != 'HitmanVRFoveationFix.ps1' ]]; then
@@ -56,27 +56,29 @@ jobs:
             exit 1
           fi
 
-          unzip -l /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip
           unzip -p /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip HitmanVRFoveationFix.ps1 > HitmanVRFoveationFix.ps1
           unzip -p /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip HitmanVRFoveationFix.bat > HitmanVRFoveationFix.bat
-          wc -l -c HitmanVRFoveationFix.ps1 HitmanVRFoveationFix.bat
-          sha256sum HitmanVRFoveationFix.ps1 HitmanVRFoveationFix.bat
-          python3 - <<'PYHASH'
-          from pathlib import Path
-          import hashlib
-          for name in ('HitmanVRFoveationFix.ps1','HitmanVRFoveationFix.bat'):
-              b=Path(name).read_bytes()
-              lf=b.replace(b'\r\n',b'\n')
-              print(name, 'crlf=', b.count(b'\r\n'), 'lf-normalized-sha256=', hashlib.sha256(lf).hexdigest())
-          PYHASH
 
-          sha256sum /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip
-          echo '--- Tested PS1 diff vs current v1.6 (ignoring CR at EOL) ---'
-          git diff --no-index --ignore-space-at-eol -- /tmp/repo-v1.6.ps1 HitmanVRFoveationFix.ps1 || true
-          echo '--- Tested BAT diff vs current v1.6 (ignoring CR at EOL) ---'
-          git diff --no-index --ignore-space-at-eol -- /tmp/repo-v1.6.bat HitmanVRFoveationFix.bat || true
-          echo 'Diagnostic run complete; stopping before any repository or release write.'
-          exit 1
+          echo '3c251616f3de8d38afdf1c3074c613868327435f5756a74fc5ac24b674bba7f1  HitmanVRFoveationFix.ps1' | sha256sum -c -
+          echo '9e8c2506e79c4eeed56f9d1066d7634e377af64492cff5471e5d4d63b33e2dd0  HitmanVRFoveationFix.bat' | sha256sum -c -
+
+      - name: Correct launcher version comment only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('HitmanVRFoveationFix.bat')
+          b = p.read_bytes()
+          old = b'HitmanVRFoveationFix v1.4.'
+          new = b'HitmanVRFoveationFix v1.6.1.'
+          if b.count(old) != 1:
+              raise SystemExit('Expected exactly one stale v1.4 launcher comment')
+          p.write_bytes(b.replace(old, new))
+          PY
+          grep -F 'Double-click this file to start HitmanVRFoveationFix v1.6.1.' HitmanVRFoveationFix.bat
+          grep -F 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0HitmanVRFoveationFix.ps1"' HitmanVRFoveationFix.bat
+          sha256sum HitmanVRFoveationFix.bat
 
       - name: Write v1.6.1 changelog
         shell: bash
@@ -88,21 +90,21 @@ jobs:
           ## Faster unknown-build startup
 
           - Replaced the PowerShell byte-by-byte fallback signature scan with an equivalent compiled matcher.
-          - Matching semantics are unchanged: `??` wildcards are preserved, every required pattern must still resolve uniquely, refraction targets are still cross-checked, and unknown builds still fail closed on any ambiguity.
-          - The verified HITMAN 3.270.1 fixed-address path is unchanged.
-          - Added scan timing to `foveationfix.log` for unknown builds.
+          - Unknown builds no longer compute a full executable SHA-256 before signature scanning. SHA-256 verification remains unchanged for the verified HITMAN 3.270.1 fixed-address path.
+          - Matching semantics remain fail-closed: `??` wildcards are preserved, every required pattern must still resolve uniquely, and refraction targets are still cross-checked.
+          - Unknown builds now show a clear scanning status and log the signature-scan duration to `foveationfix.log`.
 
           ## Why
 
-          Issue #15 exposed a startup race on an unverified HITMAN build. The old fallback scanner could take roughly 12 seconds to locate all required sites. If VR was started before that scan completed, the safety check correctly refused to patch because VR was already active.
+          Issue #15 exposed a startup timing problem on an unverified HITMAN build. The old fallback path could take roughly 12 seconds to locate all required sites. If VR was started before that work completed, the safety check correctly refused to patch because VR was already active.
 
-          The optimized scanner removes that practical timing window without weakening the pre-VR safety check.
+          The optimized fallback path removes that practical timing window without weakening the pre-VR safety check.
 
           ## Validation
 
-          The Issue #15 reporter tested the v1.6.1 candidate three times while deliberately pressing the in-game YES-to-VR prompt as quickly as possible. All three runs succeeded.
+          The Issue #15 reporter tested this v1.6.1 candidate three times while deliberately pressing the in-game YES-to-VR prompt as quickly as possible. All three runs succeeded.
 
-          Their logs measured the full 28,325,888-byte `.text` signature scan at 343 ms and 366 ms on build timestamp `1779890224`, compared with roughly 12 seconds with the previous scanner.
+          Their logs measured the full 28,325,888-byte `.text` signature scan at 343 ms and 366 ms on build timestamp `1779890224`, compared with roughly 12 seconds with the previous fallback path.
 
           ## Preserved
 
@@ -110,7 +112,7 @@ jobs:
           - v1.5 second view-count fix remains unchanged.
           - v1.4 refraction wrappers remain unchanged.
           - No renderer Scale/Mask device writes or polling renderer guard return.
-          - Linux/Proton v1.6 is unchanged; this release only optimizes the Windows PowerShell fallback scanner.
+          - Linux/Proton v1.6 is unchanged; this release only optimizes the Windows PowerShell fallback path.
           EOF
           sed -i 's/^          //' CHANGELOG-v1.6.1.md
 
@@ -128,14 +130,16 @@ jobs:
               global text
               count = text.count(old)
               if count != 1:
-                  raise SystemExit(f'Expected README anchor exactly once, found {count}: {old[:80]!r}')
+                  raise SystemExit(f'Expected README anchor exactly once, found {count}: {old[:100]!r}')
               text = text.replace(old, new, 1)
 
           replace_once(
               "## What's new in v1.6\n\nWindows v1.6 removes the last timing race in the foveation fix instead of trying to repair it faster.\n\n",
               "## What's new in v1.6.1\n\nWindows v1.6.1 keeps the v1.6 renderer fixes unchanged and makes startup on unverified HITMAN builds dramatically faster.\n\n"
               "- **Unknown-build signature scanning is now compiled.** The conservative fallback matcher no longer walks tens of megabytes byte-by-byte in PowerShell. On the Issue #15 reporter's unverified build, the full 28,325,888-byte `.text` scan dropped from roughly 12 seconds to 343–366 ms, and 3/3 tests succeeded even when YES-to-VR was pressed as quickly as possible.\n"
-              "- **Safety rules are unchanged.** Every required pattern must still resolve uniquely, refraction targets are still cross-checked, and unknown builds still fail closed on ambiguity or if VR is already active.\n\n"
+              "- **Unknown builds skip an unnecessary full-executable hash.** SHA-256 verification is still performed for the verified 3.270.1 fixed-address path; scanned builds no longer pay for a hash that was not used to trust them.\n"
+              "- **Safety rules are unchanged.** Every required pattern must still resolve uniquely, refraction targets are still cross-checked, and unknown builds still fail closed on ambiguity or if VR is already active.\n"
+              "- **Clearer startup status.** Unverified builds show `Scanning this HITMAN build` while signatures are located and write the scan duration to `foveationfix.log`.\n\n"
               "The underlying v1.6 renderer changes remain unchanged:\n\n"
           )
           replace_once('| Windows / Oculus (LibOVR) | v1.6, supported |', '| Windows / Oculus (LibOVR) | v1.6.1, supported |')
@@ -146,7 +150,7 @@ jobs:
           )
           replace_once(
               '- [`CHANGELOG-v1.6.md`](CHANGELOG-v1.6.md) — v1.6 changes',
-              '- [`CHANGELOG-v1.6.1.md`](CHANGELOG-v1.6.1.md) — v1.6.1 unknown-build scanner optimization\n- [`CHANGELOG-v1.6.md`](CHANGELOG-v1.6.md) — v1.6 renderer changes'
+              '- [`CHANGELOG-v1.6.1.md`](CHANGELOG-v1.6.1.md) — v1.6.1 unknown-build startup optimization\n- [`CHANGELOG-v1.6.md`](CHANGELOG-v1.6.md) — v1.6 renderer changes'
           )
           replace_once(
               'Detailed docs, screenshots, diagnostic tools and Linux-port files are intentionally **not** bundled into the Windows v1.6 release ZIP.',
@@ -160,6 +164,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git fetch origin main
+          if [[ "$(git rev-parse origin/main)" != "$(git rev-parse HEAD)" ]]; then
+            echo 'main moved while the release was being prepared; refusing to overwrite it.' >&2
+            exit 1
+          fi
           rm .github/workflows/publish-v1.6.1.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -168,6 +177,15 @@ jobs:
           git commit -m 'Release Windows v1.6.1'
           git push origin HEAD:main
 
+      - name: Build and verify release ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '3c251616f3de8d38afdf1c3074c613868327435f5756a74fc5ac24b674bba7f1  HitmanVRFoveationFix.ps1' | sha256sum -c -
+          zip -9 -j /tmp/HitmanVRFoveationFix-v1.6.1.zip HitmanVRFoveationFix.ps1 HitmanVRFoveationFix.bat
+          unzip -l /tmp/HitmanVRFoveationFix-v1.6.1.zip
+          sha256sum /tmp/HitmanVRFoveationFix-v1.6.1.zip HitmanVRFoveationFix.ps1 HitmanVRFoveationFix.bat
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -175,8 +193,10 @@ jobs:
         run: |
           set -euo pipefail
           final_sha="$(git rev-parse HEAD)"
-          echo '181693350b83353b0dadd9797461997b91f550c5327a5da77ac651e261ddcd9c  HitmanVRFoveationFix.ps1' | sha256sum -c -
-          echo 'beaecac916a251cca05563472ba3d0e91f859feb0c5ac016b597999eb1ad9eeb  HitmanVRFoveationFix.bat' | sha256sum -c -
+          if git ls-remote --exit-code --tags origin refs/tags/v1.6.1 >/dev/null 2>&1; then
+            echo 'Tag v1.6.1 appeared unexpectedly; refusing to overwrite it.' >&2
+            exit 1
+          fi
           gh release create v1.6.1 \
             /tmp/HitmanVRFoveationFix-v1.6.1.zip \
             --repo "${GITHUB_REPOSITORY}" \
