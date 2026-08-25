@@ -22,7 +22,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_parent='32258bcbce5ff12905f7997653bfd299c58173b6'
+          expected_parent='b0ea0944d8da8e9182b881825a11b3c59c0a097c'
           actual_parent="$(git rev-parse HEAD^)"
           if [[ "$actual_parent" != "$expected_parent" ]]; then
             echo "Unexpected release base: $actual_parent (expected $expected_parent)" >&2
@@ -54,8 +54,19 @@ jobs:
             exit 1
           fi
 
+          unzip -l /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip
           unzip -p /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip HitmanVRFoveationFix.ps1 > HitmanVRFoveationFix.ps1
           unzip -p /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip HitmanVRFoveationFix.bat > HitmanVRFoveationFix.bat
+          wc -l -c HitmanVRFoveationFix.ps1 HitmanVRFoveationFix.bat
+          sha256sum HitmanVRFoveationFix.ps1 HitmanVRFoveationFix.bat
+          python3 - <<'PYHASH'
+          from pathlib import Path
+          import hashlib
+          for name in ('HitmanVRFoveationFix.ps1','HitmanVRFoveationFix.bat'):
+              b=Path(name).read_bytes()
+              lf=b.replace(b'\r\n',b'\n')
+              print(name, 'crlf=', b.count(b'\r\n'), 'lf-normalized-sha256=', hashlib.sha256(lf).hexdigest())
+          PYHASH
 
           echo '181693350b83353b0dadd9797461997b91f550c5327a5da77ac651e261ddcd9c  HitmanVRFoveationFix.ps1' | sha256sum -c -
           echo 'beaecac916a251cca05563472ba3d0e91f859feb0c5ac016b597999eb1ad9eeb  HitmanVRFoveationFix.bat' | sha256sum -c -
