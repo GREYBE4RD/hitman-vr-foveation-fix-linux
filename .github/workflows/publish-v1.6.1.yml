@@ -22,7 +22,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_parent='b0ea0944d8da8e9182b881825a11b3c59c0a097c'
+          expected_parent='ac57e65d8b2b1043edadb9688c5a87026a4f5591'
           actual_parent="$(git rev-parse HEAD^)"
           if [[ "$actual_parent" != "$expected_parent" ]]; then
             echo "Unexpected release base: $actual_parent (expected $expected_parent)" >&2
@@ -43,6 +43,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cp HitmanVRFoveationFix.ps1 /tmp/repo-v1.6.ps1
+          cp HitmanVRFoveationFix.bat /tmp/repo-v1.6.bat
           curl -fL --retry 3 \
             -o /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip \
             'https://github.com/user-attachments/files/31352425/HitmanVRFoveationFix.1.6.1.zip'
@@ -68,10 +70,13 @@ jobs:
               print(name, 'crlf=', b.count(b'\r\n'), 'lf-normalized-sha256=', hashlib.sha256(lf).hexdigest())
           PYHASH
 
-          echo '181693350b83353b0dadd9797461997b91f550c5327a5da77ac651e261ddcd9c  HitmanVRFoveationFix.ps1' | sha256sum -c -
-          echo 'beaecac916a251cca05563472ba3d0e91f859feb0c5ac016b597999eb1ad9eeb  HitmanVRFoveationFix.bat' | sha256sum -c -
           sha256sum /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip
-          cp /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip /tmp/HitmanVRFoveationFix-v1.6.1.zip
+          echo '--- Tested PS1 diff vs current v1.6 (ignoring CR at EOL) ---'
+          git diff --no-index --ignore-space-at-eol -- /tmp/repo-v1.6.ps1 HitmanVRFoveationFix.ps1 || true
+          echo '--- Tested BAT diff vs current v1.6 (ignoring CR at EOL) ---'
+          git diff --no-index --ignore-space-at-eol -- /tmp/repo-v1.6.bat HitmanVRFoveationFix.bat || true
+          echo 'Diagnostic run complete; stopping before any repository or release write.'
+          exit 1
 
       - name: Write v1.6.1 changelog
         shell: bash
