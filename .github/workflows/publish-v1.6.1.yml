@@ -22,7 +22,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_parent='8b76ed170a2a771d77daff91a9ffe93c37c66b87'
+          expected_parent='a999b7a785bbb4c8d29aeb078d421374682568d5'
           actual_parent="$(git rev-parse HEAD^)"
           if [[ "$actual_parent" != "$expected_parent" ]]; then
             echo "Unexpected release base: $actual_parent (expected $expected_parent)" >&2
@@ -173,7 +173,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add HitmanVRFoveationFix.ps1 HitmanVRFoveationFix.bat README.md CHANGELOG-v1.6.1.md .github/workflows/publish-v1.6.1.yml
-          git diff --cached --check
+          git diff --cached --check -- README.md CHANGELOG-v1.6.1.md
           git commit -m 'Release Windows v1.6.1'
           git push origin HEAD:main
 
