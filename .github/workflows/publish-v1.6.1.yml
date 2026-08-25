@@ -1,0 +1,169 @@
+name: Publish Windows v1.6.1
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-v1.6.1.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify release base and tag state
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_parent='32258bcbce5ff12905f7997653bfd299c58173b6'
+          actual_parent="$(git rev-parse HEAD^)"
+          if [[ "$actual_parent" != "$expected_parent" ]]; then
+            echo "Unexpected release base: $actual_parent (expected $expected_parent)" >&2
+            exit 1
+          fi
+          changed="$(git diff --name-only HEAD^ HEAD)"
+          if [[ "$changed" != '.github/workflows/publish-v1.6.1.yml' ]]; then
+            echo "Trigger commit changed unexpected paths:" >&2
+            printf '%s\n' "$changed" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin refs/tags/v1.6.1 >/dev/null 2>&1; then
+            echo 'Tag v1.6.1 already exists; refusing to overwrite it.' >&2
+            exit 1
+          fi
+
+      - name: Install the externally tested v1.6.1 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 \
+            -o /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip \
+            'https://github.com/user-attachments/files/31352425/HitmanVRFoveationFix.1.6.1.zip'
+
+          mapfile -t entries < <(unzip -Z1 /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip | sort)
+          if [[ ${#entries[@]} -ne 2 || "${entries[0]}" != 'HitmanVRFoveationFix.bat' || "${entries[1]}" != 'HitmanVRFoveationFix.ps1' ]]; then
+            echo 'Test ZIP does not contain exactly the expected two files.' >&2
+            printf '  %s\n' "${entries[@]}" >&2
+            exit 1
+          fi
+
+          unzip -p /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip HitmanVRFoveationFix.ps1 > HitmanVRFoveationFix.ps1
+          unzip -p /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip HitmanVRFoveationFix.bat > HitmanVRFoveationFix.bat
+
+          echo '181693350b83353b0dadd9797461997b91f550c5327a5da77ac651e261ddcd9c  HitmanVRFoveationFix.ps1' | sha256sum -c -
+          echo 'beaecac916a251cca05563472ba3d0e91f859feb0c5ac016b597999eb1ad9eeb  HitmanVRFoveationFix.bat' | sha256sum -c -
+          sha256sum /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip
+          cp /tmp/HitmanVRFoveationFix-v1.6.1-tested.zip /tmp/HitmanVRFoveationFix-v1.6.1.zip
+
+      - name: Write v1.6.1 changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > CHANGELOG-v1.6.1.md <<'EOF'
+          # HitmanVRFoveationFix v1.6.1
+
+          ## Faster unknown-build startup
+
+          - Replaced the PowerShell byte-by-byte fallback signature scan with an equivalent compiled matcher.
+          - Matching semantics are unchanged: `??` wildcards are preserved, every required pattern must still resolve uniquely, refraction targets are still cross-checked, and unknown builds still fail closed on any ambiguity.
+          - The verified HITMAN 3.270.1 fixed-address path is unchanged.
+          - Added scan timing to `foveationfix.log` for unknown builds.
+
+          ## Why
+
+          Issue #15 exposed a startup race on an unverified HITMAN build. The old fallback scanner could take roughly 12 seconds to locate all required sites. If VR was started before that scan completed, the safety check correctly refused to patch because VR was already active.
+
+          The optimized scanner removes that practical timing window without weakening the pre-VR safety check.
+
+          ## Validation
+
+          The Issue #15 reporter tested the v1.6.1 candidate three times while deliberately pressing the in-game YES-to-VR prompt as quickly as possible. All three runs succeeded.
+
+          Their logs measured the full 28,325,888-byte `.text` signature scan at 343 ms and 366 ms on build timestamp `1779890224`, compared with roughly 12 seconds with the previous scanner.
+
+          ## Preserved
+
+          - v1.6 source-level mask patches remain unchanged.
+          - v1.5 second view-count fix remains unchanged.
+          - v1.4 refraction wrappers remain unchanged.
+          - No renderer Scale/Mask device writes or polling renderer guard return.
+          - Linux/Proton v1.6 is unchanged; this release only optimizes the Windows PowerShell fallback scanner.
+          EOF
+          sed -i 's/^          //' CHANGELOG-v1.6.1.md
+
+      - name: Update README for v1.6.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('README.md')
+          text = p.read_text(encoding='utf-8')
+
+          def replace_once(old, new):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'Expected README anchor exactly once, found {count}: {old[:80]!r}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "## What's new in v1.6\n\nWindows v1.6 removes the last timing race in the foveation fix instead of trying to repair it faster.\n\n",
+              "## What's new in v1.6.1\n\nWindows v1.6.1 keeps the v1.6 renderer fixes unchanged and makes startup on unverified HITMAN builds dramatically faster.\n\n"
+              "- **Unknown-build signature scanning is now compiled.** The conservative fallback matcher no longer walks tens of megabytes byte-by-byte in PowerShell. On the Issue #15 reporter's unverified build, the full 28,325,888-byte `.text` scan dropped from roughly 12 seconds to 343–366 ms, and 3/3 tests succeeded even when YES-to-VR was pressed as quickly as possible.\n"
+              "- **Safety rules are unchanged.** Every required pattern must still resolve uniquely, refraction targets are still cross-checked, and unknown builds still fail closed on ambiguity or if VR is already active.\n\n"
+              "The underlying v1.6 renderer changes remain unchanged:\n\n"
+          )
+          replace_once('| Windows / Oculus (LibOVR) | v1.6, supported |', '| Windows / Oculus (LibOVR) | v1.6.1, supported |')
+          replace_once('| Windows / SteamVR (OpenVR) | v1.6, supported |', '| Windows / SteamVR (OpenVR) | v1.6.1, supported |')
+          replace_once(
+              'v1.6 was tested locally with Oculus Link, Air Link and SteamVR, including repeated mission/save reloads. The original v1.5 save/reload black-circle reproducer was also retested externally on the verified SteamVR/OpenVR build with repeated reloads and did not reproduce on v1.6.',
+              'The v1.6 renderer changes were tested locally with Oculus Link, Air Link and SteamVR, including repeated mission/save reloads. The original v1.5 save/reload black-circle reproducer was also retested externally on the verified SteamVR/OpenVR build with repeated reloads and did not reproduce on v1.6. For v1.6.1, the Issue #15 reporter validated the optimized unknown-build path in three fast YES-to-VR runs; all three succeeded, with measured scan times of 343 ms and 366 ms in the supplied logs.'
+          )
+          replace_once(
+              '- [`CHANGELOG-v1.6.md`](CHANGELOG-v1.6.md) — v1.6 changes',
+              '- [`CHANGELOG-v1.6.1.md`](CHANGELOG-v1.6.1.md) — v1.6.1 unknown-build scanner optimization\n- [`CHANGELOG-v1.6.md`](CHANGELOG-v1.6.md) — v1.6 renderer changes'
+          )
+          replace_once(
+              'Detailed docs, screenshots, diagnostic tools and Linux-port files are intentionally **not** bundled into the Windows v1.6 release ZIP.',
+              'Detailed docs, screenshots, diagnostic tools and Linux-port files are intentionally **not** bundled into the Windows v1.6.1 release ZIP.'
+          )
+
+          p.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Commit the final tested source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/publish-v1.6.1.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HitmanVRFoveationFix.ps1 HitmanVRFoveationFix.bat README.md CHANGELOG-v1.6.1.md .github/workflows/publish-v1.6.1.yml
+          git diff --cached --check
+          git commit -m 'Release Windows v1.6.1'
+          git push origin HEAD:main
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          final_sha="$(git rev-parse HEAD)"
+          echo '181693350b83353b0dadd9797461997b91f550c5327a5da77ac651e261ddcd9c  HitmanVRFoveationFix.ps1' | sha256sum -c -
+          echo 'beaecac916a251cca05563472ba3d0e91f859feb0c5ac016b597999eb1ad9eeb  HitmanVRFoveationFix.bat' | sha256sum -c -
+          gh release create v1.6.1 \
+            /tmp/HitmanVRFoveationFix-v1.6.1.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "$final_sha" \
+            --title 'HitmanVRFoveationFix v1.6.1' \
+            --notes-file CHANGELOG-v1.6.1.md
