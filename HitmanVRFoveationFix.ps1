@@ -1,5 +1,13 @@
 <#
-    HitmanVRFoveationFix v1.6
+    HitmanVRFoveationFix v1.6.1
+
+    v1.6.1 is v1.6 with one thing fixed: on a build that is not the verified one,
+    the signature scan was measured at about twelve seconds. That is long enough
+    to reach the VR prompt first, and the tool then correctly refused to patch a
+    session where VR was already running (issue #15). The search now runs in
+    compiled code instead of interpreted PowerShell, and the scanned path no
+    longer hashes the executable it does not need. Nothing about what it matches,
+    or refuses to match, changed. The new duration is logged rather than claimed.
 
     v1.6 removes the race instead of defending against it.
 
@@ -65,10 +73,10 @@ param([string]$ProcessName = "HITMAN3")
 
 $ErrorActionPreference = "Stop"
 
-$FIX_VERSION = "1.6"
+$FIX_VERSION = "1.6.1"
 $MODE_INFO = [pscustomobject]@{
-    Short="v1.6"
-    Title="HitmanVRFoveationFix v1.6"
+    Short="v1.6.1"
+    Title="HitmanVRFoveationFix v1.6.1"
     Warning=""
     UsesHook=$true
     HookKinds=@("Outer","CopyA","CopyB")
@@ -101,7 +109,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 if (-not [Environment]::Is64BitProcess) {
     [Windows.Forms.MessageBox]::Show(
-        "HitmanVRFoveationFix v1.6 requires 64-bit Windows PowerShell so live code changes can be verified safely.",
+        "HitmanVRFoveationFix v1.6.1 requires 64-bit Windows PowerShell so live code changes can be verified safely.",
         "HitmanVRFoveationFix","OK","Warning") | Out-Null
     exit
 }
@@ -124,8 +132,45 @@ if (-not $script:mutexOwned) {
 if (-not ("HmFix" -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public static class HmFix {
+    // A byte-for-byte transcription of the PowerShell Find-Sig loop, moved here
+    // because PowerShell walks 28 MB of .text twelve times - eight base patterns,
+    // three refraction patterns and the device pattern. On an unknown build that
+    // was measured at about twelve seconds, which is long enough to reach the VR
+    // prompt first; the tool then correctly refused to patch a live VR session
+    // (issue #15).
+    //
+    // Deliberately NOT a cleverer algorithm. Same anchor (the first non-wildcard
+    // byte), same first-byte prefilter, same full comparison including wildcards,
+    // same early exit once more than maxHits matches are found. Only the language
+    // changed, so the matching semantics cannot have.
+    public static int[] FindPattern(byte[] hay, int[] pat, int maxHits) {
+        int n = pat.Length;
+        if (hay == null || n == 0 || hay.Length < n) return new int[0];
+        int anchor = 0;
+        while (anchor < n && pat[anchor] < 0) anchor++;
+        // An all-wildcard pattern would have thrown in PowerShell. Here it simply
+        // matches nothing, which the caller turns into a fail-closed refusal.
+        if (anchor >= n) return new int[0];
+        byte first = (byte)pat[anchor];
+        int limit = hay.Length - n;
+        List<int> hits = new List<int>();
+        for (int p = 0; p <= limit; p++) {
+            if (hay[p + anchor] != first) continue;
+            bool ok = true;
+            for (int i = 0; i < n; i++) {
+                int v = pat[i];
+                if (v >= 0 && hay[p + i] != v) { ok = false; break; }
+            }
+            if (ok) {
+                hits.Add(p);
+                if (hits.Count > maxHits) break;
+            }
+        }
+        return hits.ToArray();
+    }
     [DllImport("kernel32.dll", SetLastError=true)]
     public static extern IntPtr OpenProcess(uint a, bool i, int p);
     [DllImport("kernel32.dll", SetLastError=true)]
@@ -970,20 +1015,22 @@ function Read-PE { param([string]$path)
     [Array]::Copy($b,$tOff,$text,0,$tSize)
     return [pscustomobject]@{ Stamp=$stamp; TextRVA=$tRVA; Text=$text } }
 
+# Pattern parsing is unchanged and still happens here; only the search itself
+# moved into HmFix.FindPattern. maxHits=1 reproduces the old early exit exactly:
+# the loop stopped as soon as a second match was found, because every caller
+# treats "not exactly one" as a refusal.
 function Find-Sig { param([byte[]]$hay,[string]$pat)
     $tok=$pat.Split(" "); $n=$tok.Count
     $val=New-Object int[] $n
     for ($i=0;$i -lt $n;$i++) {
         if ($tok[$i] -eq "??") { $val[$i]=-1 } else { $val[$i]=[Convert]::ToInt32($tok[$i],16) } }
-    $a=0; while ($a -lt $n -and $val[$a] -lt 0) { $a++ }
-    $first=[byte]$val[$a]
-    $hits=@(); $limit=$hay.Length-$n
-    for ($p=0; $p -le $limit; $p++) {
-        if ($hay[$p+$a] -ne $first) { continue }
-        $ok=$true
-        for ($i=0;$i -lt $n;$i++) {
-            if ($val[$i] -ge 0 -and $hay[$p+$i] -ne $val[$i]) { $ok=$false; break } }
-        if ($ok) { $hits+=$p; if ($hits.Count -gt 1) { return $hits } } }
+    # No unary comma here. ",$array" would return the int[] as ONE pipeline
+    # object, so @(Find-Sig ...) would always have Count 1 and the fail-closed
+    # "exactly one match" test would pass for zero and for two matches alike.
+    # Returning the array plainly lets PowerShell enumerate it, so the callers
+    # see 0, 1 or 2 offsets as they always did.
+    [int[]]$hits = [HmFix]::FindPattern($hay,$val,1)
+    if ($null -eq $hits) { return @() }
     return $hits }
 
 # --- state -----------------------------------------------------------------
@@ -1084,7 +1131,7 @@ function Changes-MayBeLive {
 
 # --- window ----------------------------------------------------------------
 $form=New-Object Windows.Forms.Form
-$form.Text="HitmanVRFoveationFix v1.6"
+$form.Text="HitmanVRFoveationFix v1.6.1"
 $form.ClientSize=New-Object Drawing.Size(520,318)
 $form.FormBorderStyle="FixedSingle"; $form.MaximizeBox=$false
 $form.StartPosition="CenterScreen"
@@ -1132,8 +1179,8 @@ $form.Controls.Add($btnStop)
 
 $link=New-Object Windows.Forms.LinkLabel
 $link.Location=New-Object Drawing.Point(240,260); $link.Size=New-Object Drawing.Size(260,22)
-$link.Text="v1.6 - project page"
-$link.LinkArea=New-Object Windows.Forms.LinkArea(0,4)
+$link.Text="v1.6.1 - project page"
+$link.LinkArea=New-Object Windows.Forms.LinkArea(0,6)
 $link.TextAlign="MiddleRight"
 $link.Add_LinkClicked({ Start-Process "https://github.com/RealChrizzl/hitman-vr-foveation-fix" })
 $form.Controls.Add($link)
@@ -1165,11 +1212,14 @@ function Try-Attach {
     try { $peCheck=Read-PE $path }
     catch { $script:fatal="Could not verify the game executable's code section."; return $false }
     $stamp=$peCheck.Stamp
-    try { $exeHash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToUpperInvariant() }
-    catch { $script:fatal="Could not verify the game executable."; return $false }
 
     $sites=@(); $guards=@(); $hooks=@(); $mode=""; $slot=0L; $wno=0x31BL
     if ($stamp -eq $VERIFIED_TIMESTAMP) {
+        # The hash only ever gated the verified path, so it is computed there.
+        # An unknown build no longer pays for a SHA-256 of the whole executable
+        # before a scan it is already waiting on.
+        try { $exeHash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToUpperInvariant() }
+        catch { $script:fatal="Could not verify the game executable."; return $false }
         if ($exeHash -ne $VERIFIED_SHA256) {
             Log ("refused executable hash {0}" -f $exeHash)
             $script:fatal="This executable has the verified build number but different code. Nothing was changed."
@@ -1195,6 +1245,14 @@ function Try-Attach {
         $wno=$VERIFIED_WNO_OFF
     } else {
         $mode="scanned"
+        # This build is not the verified one, so every site has to be located by
+        # signature. Say so and PAINT it before the scan starts - Refresh forces
+        # an immediate repaint without pumping the message queue, so the timer
+        # cannot re-enter this function while it runs.
+        Show-State "amber" "Scanning this HITMAN build" "This build is not the verified one, so the code is being located by signature. Please wait for this window before starting VR."
+        try { $form.Refresh() } catch {}
+        $scanClock=[Diagnostics.Stopwatch]::StartNew()
+
         foreach ($sig in $SIGS) {
             $hits=@(Find-Sig $peCheck.Text $sig.Pattern)
             if ($hits.Count -ne 1) {
@@ -1242,6 +1300,10 @@ function Try-Attach {
         if ($wno -le 0 -or $wno -gt 0x4000) {
             $script:fatal="Implausible device layout in this build. Nothing was changed."
             return $false }
+
+        $scanClock.Stop()
+        Log ("signature scan finished in {0} ms over {1} bytes of .text, {2} base + {3} refraction + 1 device pattern" -f `
+            [int]$scanClock.ElapsedMilliseconds,$peCheck.Text.Length,$SIGS.Count,$HOOK_SIGS.Count)
     }
 
     $hnd=[HmFix]::OpenProcess(0x1F0FFF,$false,$p.Id)
@@ -1712,7 +1774,7 @@ function Apply-Code {
         return $false }
     $script:writtenSites=$written
     $script:patched=$true
-    Log ("v1.6 code patched, base sites {0}, refraction calls {1}" -f $written.Count,$hookWritten.Count)
+    Log ("v1.6.1 code patched, base sites {0}, refraction calls {1}" -f $written.Count,$hookWritten.Count)
     return $true }
 
 # Restore every code block owned by this instance while HITMAN is still live.
@@ -1822,7 +1884,7 @@ $timer.Add_Tick({
             $gameClosed=(-not (Game-IsAlive))
             if ($gameClosed) {
                 Log "game closed"; Detach; $script:fatal=""
-                Show-State "grey" "Waiting for HITMAN" "The game was closed. Start it again and v1.6 will apply automatically."
+                Show-State "grey" "Waiting for HITMAN" "The game was closed. Start it again and v1.6.1 will apply automatically."
                 $btnStop.Enabled=$false; return } }
 
         if ($script:suspendedHandles.Count -gt 0) {
@@ -1849,7 +1911,7 @@ $timer.Add_Tick({
         $warn=""
         if ($script:mode -eq "scanned") {
             $warn="Untested build - every code pattern was unique, but please check the image carefully." }
-        $ready="v1.6 is patched. Put on your headset, start VR as usual, then load a mission."
+        $ready="v1.6.1 is patched. Put on your headset, start VR as usual, then load a mission."
 
         if (-not $script:patched) {
             if (-not (Apply-Code)) { return }
@@ -1971,7 +2033,7 @@ $btnStop.Add_Click({
     Detach
     $script:stopped=$true; $script:fatal=""
     $btnStop.Enabled=$false
-    Show-State "grey" "Turned off" "Everything owned by v1.6 was restored. Close and reopen this tool to use the fix again." })
+    Show-State "grey" "Turned off" "Everything owned by v1.6.1 was restored. Close and reopen this tool to use the fix again." })
 
 $form.Add_FormClosing({ param($sender,$eventArgs)
     if ($script:unsafeCodeState -and (Game-IsAlive)) {

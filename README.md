@@ -6,9 +6,16 @@ HITMAN's PC VR renderer uses fixed foveation: a small high-resolution area in th
 
 HitmanVRFoveationFix changes the renderer to use two full-resolution eye layers across the full field of view while preserving the four logical views HITMAN still expects for geometry and visibility.
 
-## What's new in v1.6
+## What's new in v1.6.1
 
-Windows v1.6 removes the last timing race in the foveation fix instead of trying to repair it faster.
+Windows v1.6.1 keeps the v1.6 renderer fixes unchanged and makes startup on unverified HITMAN builds dramatically faster.
+
+- **Unknown-build signature scanning is now compiled.** The conservative fallback matcher no longer walks tens of megabytes byte-by-byte in PowerShell. On the Issue #15 reporter's unverified build, the full 28,325,888-byte `.text` scan dropped from roughly 12 seconds to 343–366 ms, and 3/3 tests succeeded even when YES-to-VR was pressed as quickly as possible.
+- **Unknown builds skip an unnecessary full-executable hash.** SHA-256 verification is still performed for the verified 3.270.1 fixed-address path; scanned builds no longer pay for a hash that was not used to trust them.
+- **Safety rules are unchanged.** Every required pattern must still resolve uniquely, refraction targets are still cross-checked, and unknown builds still fail closed on ambiguity or if VR is already active.
+- **Clearer startup status.** Unverified builds show `Scanning this HITMAN build` while signatures are located and write the scan duration to `foveationfix.log`.
+
+The underlying v1.6 renderer changes remain unchanged:
 
 - **Save/reload black circles fixed at the source.** HITMAN's own mask calculation is patched so the two foveation-mask values are generated as zero every time the renderer rebuilds, including save-game loads.
 - **The polling renderer guard is gone.** v1.6 no longer writes Scale/Mask values into the VR device and no longer needs the ~1 ms worker thread, high-resolution timer, renderer-value ownership state or reload-recovery latch used by v1.5.
@@ -21,14 +28,14 @@ The v1.5 second view-count fix and the v1.4 transparency/refraction fix are pres
 
 | Platform | Status |
 |---|---|
-| Windows / Oculus (LibOVR) | v1.6, supported |
-| Windows / SteamVR (OpenVR) | v1.6, supported |
+| Windows / Oculus (LibOVR) | v1.6.1, supported |
+| Windows / SteamVR (OpenVR) | v1.6.1, supported |
 | Linux / Proton / SteamVR | Experimental v1.6 port |
 | Standalone Quest | Not supported |
 
 The Windows implementation is verified against HITMAN World of Assassination build **3.270.1**. Other builds use conservative byte-pattern matching and fail closed if the required code cannot be located uniquely.
 
-v1.6 was tested locally with Oculus Link, Air Link and SteamVR, including repeated mission/save reloads. The original v1.5 save/reload black-circle reproducer was also retested externally on the verified SteamVR/OpenVR build with repeated reloads and did not reproduce on v1.6.
+The v1.6 renderer changes were tested locally with Oculus Link, Air Link and SteamVR, including repeated mission/save reloads. The original v1.5 save/reload black-circle reproducer was also retested externally on the verified SteamVR/OpenVR build with repeated reloads and did not reproduce on v1.6. For v1.6.1, the Issue #15 reporter validated the optimized unknown-build path in three fast YES-to-VR runs; all three succeeded, with measured scan times of 343 ms and 366 ms in the supplied logs.
 
 The improvement is most visible on pancake-lens headsets such as Quest 3 and Quest Pro, but the fix also works with Fresnel headsets.
 
@@ -147,9 +154,10 @@ The repository contains additional material for maintenance and reverse engineer
 - [`docs/HOW-IT-WORKS.md`](https://github.com/RealChrizzl/hitman-vr-foveation-fix/blob/main/docs/HOW-IT-WORKS.md) — renderer architecture and patch rationale
 - [`docs/UPDATING.md`](https://github.com/RealChrizzl/hitman-vr-foveation-fix/blob/main/docs/UPDATING.md) — signatures and update procedure
 - [`tools/HitmanVRProbe.ps1`](https://github.com/RealChrizzl/hitman-vr-foveation-fix/blob/main/tools/HitmanVRProbe.ps1) — read-only diagnostic probe
-- [`CHANGELOG-v1.6.md`](CHANGELOG-v1.6.md) — v1.6 changes
+- [`CHANGELOG-v1.6.1.md`](CHANGELOG-v1.6.1.md) — v1.6.1 unknown-build startup optimization
+- [`CHANGELOG-v1.6.md`](CHANGELOG-v1.6.md) — v1.6 renderer changes
 
-Detailed docs, screenshots, diagnostic tools and Linux-port files are intentionally **not** bundled into the Windows v1.6 release ZIP.
+Detailed docs, screenshots, diagnostic tools and Linux-port files are intentionally **not** bundled into the Windows v1.6.1 release ZIP.
 
 ## Reporting problems
 
